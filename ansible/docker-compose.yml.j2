@@ -1,0 +1,17 @@
+services:
+  vault:
+    container_name: vault
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UID: 5000
+        GID: 5000
+    ports:
+      - "8200:8200"
+    volumes:
+      - {{ vault_config_dir }}:/vault/config:ro
+      - {{ vault_data_dir }}:/vault/data:rw
+    cap_add:
+      - IPC_LOCK
+    command: server

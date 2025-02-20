@@ -1,0 +1,214 @@
+---
+- name: Deploy Hashicorp Vault
+  hosts: all
+  become: true
+  vars:
+    vault_dir: /opt/vault
+    vault_config_dir: "{{ vault_dir }}/config"
+    vault_data_dir: "{{ vault_dir }}/data"
+    vault_addr: "http://127.0.0.1:8200"
+    root_token: "{{ vault_root_token | default(omit) }}"
+
+  tasks:
+    - name: Show Ansible version. For troubleshooting
+      debug:
+        msg: "Ansible version is  {{ ansible_version.full }}"
+
+    - name: Check if this playbook has rebooted the machine before
+      ansible.builtin.stat:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+      register: reboot_file
+
+    - name: Reboot on the playbook's first run to start fresh after the changes made by user data
+      ansible.builtin.reboot:
+        post_reboot_delay: 10
+        connect_timeout: 120
+      when: not reboot_file.stat.exists
+      register: reboot_result
+
+    - name: Create file to indicate reboot happened on the playbook's first run
+      ansible.builtin.file:
+        path: /var/tmp/ansible_rebooted_this_machine_before.txt
+        state: touch
+      when:
+        - reboot_file.stat.exists == false
+        - reboot_result is succeeded
+
+    - name: Create Vault directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+        recurse: yes
+      loop:
+        - "{{ vault_config_dir }}"
+        - "{{ vault_data_dir }}"
+
+    - name: Copy Vault configuration file
+      ansible.builtin.copy:
+        src: vault.hcl
+        dest: "{{ vault_config_dir }}/vault.hcl"
+        mode: '0644'
+
+    - name: Copy Dockerfile
+      ansible.builtin.copy:
+        src: Dockerfile
+        dest: "{{ vault_dir }}/Dockerfile"
+        mode: '0644'
+
+    - name: Copy Docker Compose file
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ vault_dir }}/docker-compose.yml"
+        mode: '0644'
+
+    - name: Create vault group
+      ansible.builtin.group:
+        name: vault
+        gid: 5000
+        state: present
+
+    - name: Create vault user
+      ansible.builtin.user:
+        name: vault
+        uid: 5000
+        group: vault
+        system: yes
+
+    - name: Ensure vault user has access to data directory
+      ansible.builtin.file:
+        path: "{{ vault_data_dir }}"
+        owner: vault
+        group: vault
+        mode: '0755'
+        state: directory
+
+    - name: Start Vault container
+      community.docker.docker_compose_v2:
+        project_src: "{{ vault_dir }}"
+        files:
+          - docker-compose.yml
+        state: present
+
+    - name: Wait for Vault to start
+      ansible.builtin.wait_for:
+        port: 8200
+        delay: 10
+
+    - name: Check if Vault is initialized
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/init"
+        method: GET
+      register: init_status
+      failed_when: false
+
+    - name: Initialize Vault if not already initialized
+      ansible.builtin.command: docker exec -e VAULT_ADDR=http://127.0.0.1:8200 vault vault operator init -key-shares=1 -key-threshold=1 -format=json
+      register: init_output
+      changed_when: true
+      when: not init_status.json.initialized | default(false)
+
+    - name: Show output
+      ansible.builtin.debug:
+        msg: "{{ init_output }}"
+      when: not init_status.json.initialized
+
+    - name: Extract root token and unseal key
+      ansible.builtin.set_fact:
+        root_token: "{{ (init_output.stdout | from_json).root_token }}"
+        unseal_key: "{{ (init_output.stdout | from_json).unseal_keys_b64[0] }}"
+      when: not init_status.json.initialized
+
+    - name: Check if Vault is sealed
+      ansible.builtin.uri:
+        url: "{{ vault_addr }}/v1/sys/seal-status"
+        method: GET
+      register: seal_status
+      failed_when: false
+
+    - name: Unseal Vault if sealed
+      ansible.builtin.command: docker exec -e VAULT_ADDR=http://127.0.0.1:8200 vault vault operator unseal {{ unseal_key }}
+      when: seal_status.json.sealed | default(true)
+
+    - name: Install pip for python3
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Install hvac library
+      ansible.builtin.pip:
+        name: hvac
+        state: present
+        break_system_packages: true
+
+    - name: Check if KV secrets engine is enabled
+      community.hashi_vault.vault_read:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        path: sys/mounts/secret
+      register: kv_mount
+      failed_when: false
+
+    - name: Set KV status
+      set_fact:
+        kv_enabled: "{{ not kv_mount.failed and (kv_mount.data | default({})).get('type') == 'kv' }}"
+
+    - name: Enable KV secrets engine if not already enabled
+      community.hashi_vault.vault_write:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        path: sys/mounts/secret
+        data:
+          type: kv-v2
+      when: not kv_enabled
+
+    - name: Create read-only policy
+      community.hashi_vault.vault_write:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        path: sys/policies/acl/read-only
+        data:
+          policy: |
+            path "secret/data/*" {
+              capabilities = ["read", "list"]
+            }
+            path "secret/metadata/*" {
+              capabilities = ["list"]
+            }
+
+    - name: Create read-write policy
+      community.hashi_vault.vault_write:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        path: sys/policies/acl/read-write
+        data:
+          policy: |
+            path "secret/data/*" {
+              capabilities = ["create", "read", "update", "delete", "list"]
+            }
+            path "secret/metadata/*" {
+              capabilities = ["list", "create", "update", "delete"]
+            }
+
+    - name: Create read-only token
+      community.hashi_vault.vault_token_create:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        policies:
+          - read-only
+      register: read_token
+
+    - name: Create read-write token
+      community.hashi_vault.vault_token_create:
+        url: "{{ vault_addr }}"
+        token: "{{ root_token }}"
+        policies:
+          - read-write
+      register: write_token
+
+    - name: Display created tokens
+      ansible.builtin.debug:
+        msg: |
+          Read-only token: {{ read_token.login.auth.client_token }}
+          Read-write token: {{ write_token.login.auth.client_token }}
