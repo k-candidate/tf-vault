@@ -37,7 +37,7 @@ variable "vm_username" {
 variable "vm_hostname" {
   description = "Hostname of the machine"
   type        = string
-  default     = "root-ca.domain.dom"
+  default     = "vault.domain.dom"
 }
 
 variable "ssh_public_key" {
