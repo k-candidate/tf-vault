@@ -1,2 +1,2 @@
 # tf-vault
-Vault Terraform component
+Terraform component for Vault as a Secrets Management platform
